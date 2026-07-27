@@ -37,6 +37,18 @@ That's it — `owl24.Init(...)` wires up traces, logs, and host metrics pointed 
 - **Crash capture**: `owl24.Recover()` — see below, this is the one place Go's design differs meaningfully from the other owl24 SDKs.
 - **PII masking**: emails, credit-card-shaped numbers, phone numbers, and bearer tokens are scrubbed from span attributes and log bodies before they ever leave your process.
 
+## Logging
+
+All log lines are plain text, no icons: `[Owl24] ...`.
+
+Each of the three signals (traces/metrics/logs) reports whether it's actually getting data through, for the life of the process:
+
+- `[Owl24] traces working` / `[Owl24] metrics working` / `[Owl24] logs working` — printed the first time a signal is confirmed delivering (and again after recovering from an outage).
+- `[Owl24] traces not working because: <reason>` (same for metrics/logs) — printed once a signal fails 3 consecutive attempts. This only triggers at two points: the very first export attempt for a signal, or the first failure after a signal was previously working — not on every routine flush, so a signal that's already known to be down doesn't spam this line on every scheduled export.
+- `[Owl24] engaged fully` / `[Owl24] partially engaged` / `[Owl24] failed to engage` — an aggregate line, re-printed only when it changes, once all three signals have resolved at least once.
+
+This status tracking is entirely local — nothing is reported back to owl24's backend, it's just clearer logging in your own process/console.
+
 ## Crash capture — `owl24.Recover()`
 
 Go has no global uncaught-panic hook the way Python's `sys.excepthook`, Node's `process.on('uncaughtException')`, or Java's `Thread.setDefaultUncaughtExceptionHandler` provide. A panic can only ever be recovered by a deferred call in the *exact same goroutine* where it happened — there's no single place to install a process-wide handler. That means you need to explicitly add `defer owl24.Recover()` to `main()` **and to every goroutine you spawn that could panic**:

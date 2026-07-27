@@ -140,7 +140,7 @@ func Init(apiKey, serviceName string) {
 		apiKey = os.Getenv("OBSERVE_API_KEY")
 	}
 	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "❌ [Owl24] API Key required.")
+		fmt.Fprintln(os.Stderr, "[Owl24] API Key required.")
 		return
 	}
 
@@ -164,22 +164,30 @@ func Init(apiKey, serviceName string) {
 		semconv.ServiceVersion("0.1.0"),
 	))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ [Owl24] Init failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[Owl24] Init failed: %v\n", err)
 		return
 	}
+
+	// Tracks whether each of traces/metrics/logs is actually getting
+	// through (not just whether it was built without error) - logs
+	// "<signal> working"/"<signal> not working because: ..." on each
+	// transition and the "engaged fully/partially/failed to engage"
+	// aggregate once all 3 have resolved at least once.
+	tracker := newStatusTracker()
 
 	traceExporter, err := otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpointURL(ingestBaseURL+"/v1/traces"),
 		otlptracehttp.WithHeaders(headers),
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ [Owl24] Init failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[Owl24] Init failed: %v\n", err)
 		return
 	}
 
+	trackedTraceExporter := &statusTrackingSpanExporter{delegate: traceExporter, tracker: tracker}
 	tracerProvider = sdktrace.NewTracerProvider(
 		sdktrace.WithResource(res),
-		sdktrace.WithSpanProcessor(&maskingSpanProcessor{wrapped: sdktrace.NewBatchSpanProcessor(traceExporter)}),
+		sdktrace.WithSpanProcessor(&maskingSpanProcessor{wrapped: sdktrace.NewBatchSpanProcessor(trackedTraceExporter)}),
 	)
 	otel.SetTracerProvider(tracerProvider)
 
@@ -188,13 +196,14 @@ func Init(apiKey, serviceName string) {
 		otlpmetrichttp.WithHeaders(headers),
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ [Owl24] Init failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[Owl24] Init failed: %v\n", err)
 		return
 	}
 
+	trackedMetricExporter := &statusTrackingMetricExporter{delegate: metricExporter, tracker: tracker}
 	meterProvider = metric.NewMeterProvider(
 		metric.WithResource(res),
-		metric.WithReader(metric.NewPeriodicReader(metricExporter, metric.WithInterval(3*time.Second))),
+		metric.WithReader(metric.NewPeriodicReader(trackedMetricExporter, metric.WithInterval(3*time.Second))),
 	)
 	otel.SetMeterProvider(meterProvider)
 
@@ -203,13 +212,14 @@ func Init(apiKey, serviceName string) {
 		otlploghttp.WithHeaders(headers),
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ [Owl24] Init failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[Owl24] Init failed: %v\n", err)
 		return
 	}
 
+	trackedLogExporter := &statusTrackingLogExporter{delegate: logExporter, tracker: tracker}
 	loggerProvider = sdklog.NewLoggerProvider(
 		sdklog.WithResource(res),
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(trackedLogExporter)),
 	)
 	loggl.SetLoggerProvider(loggerProvider)
 	otelLogger = loggerProvider.Logger("console-bridge")
@@ -218,7 +228,7 @@ func Init(apiKey, serviceName string) {
 	// owl24-js's HostMetrics and owl24-java's runtime-telemetry-java8
 	// observers.
 	if err := otelruntime.Start(otelruntime.WithMeterProvider(meterProvider)); err != nil {
-		fmt.Fprintf(os.Stderr, "⚠️ [Owl24] Failed to start host metrics: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[Owl24] Failed to start host metrics: %v\n", err)
 	}
 
 	// Bridges Go's standard `log` package (its shared/default logger) to
@@ -229,7 +239,10 @@ func Init(apiKey, serviceName string) {
 	// original destination unchanged.
 	log.SetOutput(&consoleBridgeWriter{original: os.Stderr})
 
-	fmt.Printf("🚀 [Owl24] Universal APM Active: %s\n", serviceName)
+	// No synchronous "Active" print here: Init() stays non-blocking. Each
+	// signal's working/not-working state (and the "engaged fully/partially
+	// engaged/failed to engage" aggregate) is instead reported
+	// asynchronously by tracker as each signal's first flush resolves.
 }
 
 // Tracer returns a tracer for creating manual spans. Go's net/http has no
@@ -286,7 +299,7 @@ func Recover() {
 		if tracerProvider != nil {
 			_ = tracerProvider.ForceFlush(flushCtx)
 		}
-		fmt.Fprintf(os.Stderr, "❌ [Owl24] Recovered panic: %v\n", r)
+		fmt.Fprintf(os.Stderr, "[Owl24] Recovered panic: %v\n", r)
 		panic(r)
 	}
 }
