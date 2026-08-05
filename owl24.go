@@ -161,7 +161,7 @@ func Init(apiKey, serviceName string) {
 
 	res, err := resource.New(ctx, resource.WithAttributes(
 		semconv.ServiceName(serviceName),
-		semconv.ServiceVersion("0.1.0"),
+		semconv.ServiceVersion("0.1.2"),
 	))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Owl24] Init failed: %v\n", err)
@@ -188,6 +188,7 @@ func Init(apiKey, serviceName string) {
 	tracerProvider = sdktrace.NewTracerProvider(
 		sdktrace.WithResource(res),
 		sdktrace.WithSpanProcessor(&maskingSpanProcessor{wrapped: sdktrace.NewBatchSpanProcessor(trackedTraceExporter)}),
+		sdktrace.WithSpanProcessor(&dbMetricsSpanProcessor{}),
 	)
 	otel.SetTracerProvider(tracerProvider)
 

@@ -33,6 +33,7 @@ That's it — `owl24.Init(...)` wires up traces, logs, and host metrics pointed 
 
 - **Logs**: bridges Go's standard `log` package (its shared/default logger) — every `log.Print`/`Printf`/`Println` call anywhere in the process is forwarded as a structured log.
 - **Traces**: sets up an OpenTelemetry `TracerProvider` exporting via OTLP/HTTP. Use `owl24.Tracer()` to create manual spans — see [Automatic HTTP tracing](#automatic-http-tracing) below for framework auto-instrumentation.
+- **Database metrics**: queries run through `owl24.WrapDB(...)` (see [Database metrics](#database-metrics)) are automatically turned into `db.query.count`/`db.query.duration_ms`/`db.query.error_count` on your dashboard's Database page.
 - **Host metrics**: CPU, memory, GC, and goroutine counts are collected and exported automatically via `go.opentelemetry.io/contrib/instrumentation/runtime` — no setup required.
 - **Crash capture**: `owl24.Recover()` — see below, this is the one place Go's design differs meaningfully from the other owl24 SDKs.
 - **PII masking**: emails, credit-card-shaped numbers, phone numbers, and bearer tokens are scrubbed from span attributes and log bodies before they ever leave your process.
@@ -78,6 +79,21 @@ Note: an HTTP handler that panics is usually a different story — `net/http`'s 
 ctx, span := owl24.Tracer().Start(r.Context(), r.URL.Path)
 defer span.End()
 ```
+
+## Database metrics
+
+Go has no driver auto-instrumentation mechanism (no bytecode weaving/monkey-patching), so DB calls need an explicit wrapper to produce traced spans. Wrap your `*sql.DB` with `owl24.WrapDB(...)` and use the returned `*owl24.DB` in place of it:
+
+```go
+db, err := sql.Open("postgres", dsn)
+tracedDB := owl24.WrapDB(db, "postgresql", "mydb") // dbSystem, dbName
+
+rows, err := tracedDB.QueryContext(ctx, "SELECT 1")
+result, err := tracedDB.ExecContext(ctx, "UPDATE ...")
+row := tracedDB.QueryRowContext(ctx, "SELECT ...")
+```
+
+Each call creates a span tagged with `db.system`/`db.name`, which is automatically turned into `db.query.count`, `db.query.duration_ms`, and `db.query.error_count` on your dashboard's Database page, grouped by DB system.
 
 ## License
 
