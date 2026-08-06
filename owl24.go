@@ -41,7 +41,7 @@ const ingestBaseURL = "https://ingest.owl24.dev"
 // module versions live in git tags, external to the source. So this has to
 // be maintained by hand, kept in sync with whatever tag gets pushed for
 // each release.
-const sdkVersion = "0.1.2"
+const sdkVersion = "0.1.3"
 
 // checkSdkVersion is called once at the very start of Init() - separate
 // from the OTLP exporters below, since their interfaces never expose the
@@ -224,7 +224,7 @@ func Init(apiKey, serviceName string) {
 
 	res, err := resource.New(ctx, resource.WithAttributes(
 		semconv.ServiceName(serviceName),
-		semconv.ServiceVersion("0.1.2"),
+		semconv.ServiceVersion("0.1.3"),
 	))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Owl24] Init failed: %v\n", err)

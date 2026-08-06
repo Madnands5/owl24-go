@@ -116,9 +116,17 @@ func WrapDB(db *sql.DB, dbSystem, dbName string) *DB {
 	return &DB{inner: db, dbSystem: dbSystem, dbName: dbName}
 }
 
-func (d *DB) startSpan(ctx context.Context, name string) (context.Context, trace.Span) {
+// startSpan sets db.statement from the caller's own query/exec text - this
+// is safe to attach as-is (not just after masking) because the callers
+// below only ever pass the parameterized statement itself (placeholders
+// like $1, never the bound argument values), and it still passes through
+// maskingSpanProcessor like every other string attribute regardless.
+func (d *DB) startSpan(ctx context.Context, name, statement string) (context.Context, trace.Span) {
 	ctx, span := Tracer().Start(ctx, name)
-	attrs := []attribute.KeyValue{attribute.String("db.system", d.dbSystem)}
+	attrs := []attribute.KeyValue{
+		attribute.String("db.system", d.dbSystem),
+		attribute.String("db.statement", statement),
+	}
 	if d.dbName != "" {
 		attrs = append(attrs, attribute.String("db.name", d.dbName))
 	}
@@ -136,7 +144,7 @@ func endSpan(span trace.Span, err error) {
 
 // QueryContext wraps (*sql.DB).QueryContext.
 func (d *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	ctx, span := d.startSpan(ctx, "db.query")
+	ctx, span := d.startSpan(ctx, "db.query", query)
 	rows, err := d.inner.QueryContext(ctx, query, args...)
 	endSpan(span, err)
 	return rows, err
@@ -146,7 +154,7 @@ func (d *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.
 // from the returned *sql.Row's own Scan/Err, so - unlike QueryContext/
 // ExecContext - the span here can only ever report as OK.
 func (d *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	ctx, span := d.startSpan(ctx, "db.query")
+	ctx, span := d.startSpan(ctx, "db.query", query)
 	row := d.inner.QueryRowContext(ctx, query, args...)
 	endSpan(span, nil)
 	return row
@@ -154,7 +162,7 @@ func (d *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sq
 
 // ExecContext wraps (*sql.DB).ExecContext.
 func (d *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	ctx, span := d.startSpan(ctx, "db.exec")
+	ctx, span := d.startSpan(ctx, "db.exec", query)
 	result, err := d.inner.ExecContext(ctx, query, args...)
 	endSpan(span, err)
 	return result, err
