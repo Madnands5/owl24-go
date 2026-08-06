@@ -5,8 +5,10 @@ package owl24
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"regexp"
 	"runtime/debug"
@@ -33,6 +35,52 @@ import (
 // there's nothing for a caller to legitimately point this at instead. See
 // the equivalent, deliberate choice in owl24-js/owl24-py/owl24-java.
 const ingestBaseURL = "https://ingest.owl24.dev"
+
+// Go has no runtime package-version introspection (unlike owl24-py's
+// importlib.metadata) and go.mod carries no version field of its own -
+// module versions live in git tags, external to the source. So this has to
+// be maintained by hand, kept in sync with whatever tag gets pushed for
+// each release.
+const sdkVersion = "0.1.2"
+
+// checkSdkVersion is called once at the very start of Init() - separate
+// from the OTLP exporters below, since their interfaces never expose the
+// underlying HTTP response, only success/failure, so there's no way to
+// detect ingestor.js's 426 Upgrade Required from inside a normal export
+// call. A short timeout and a blanket error-swallow mean a slow/unreachable
+// server here degrades to "assume fine, proceed" rather than delaying or
+// breaking the host app's own startup.
+func checkSdkVersion(ctx context.Context, baseURL, apiKey, userEmail string, timeout time.Duration) bool {
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+"/v1/sdk-check", nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("x-user-email", userEmail)
+	req.Header.Set("x-sdk-language", "go")
+	req.Header.Set("x-sdk-version", sdkVersion)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		UpdateRequired bool `json:"update_required"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return false
+	}
+	if body.UpdateRequired {
+		fmt.Fprintln(os.Stderr, "[Owl24] Please Update package. telemetry shutting down")
+		return true
+	}
+	return false
+}
 
 var (
 	tracerProvider *sdktrace.TracerProvider
@@ -156,8 +204,23 @@ func Init(apiKey, serviceName string) {
 		serviceName = "dice-server"
 	}
 
-	headers := map[string]string{"x-api-key": apiKey, "x-user-email": userEmail}
 	ctx := context.Background()
+
+	// Server-side version gate (ingestor.js) refuses actual telemetry
+	// ingestion from a version this far behind anyway - checking here
+	// first means a customer running a known-bad old release finds out via
+	// a clear log line at startup, instead of every export silently
+	// failing with no explanation.
+	if checkSdkVersion(ctx, ingestBaseURL, apiKey, userEmail, 5*time.Second) {
+		return
+	}
+
+	headers := map[string]string{
+		"x-api-key":      apiKey,
+		"x-user-email":   userEmail,
+		"x-sdk-language": "go",
+		"x-sdk-version":  sdkVersion,
+	}
 
 	res, err := resource.New(ctx, resource.WithAttributes(
 		semconv.ServiceName(serviceName),
