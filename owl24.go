@@ -4,13 +4,13 @@
 package owl24
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"regexp"
 	"runtime/debug"
 	"time"
 
@@ -89,22 +89,22 @@ var (
 	otelLogger     otellog.Logger
 )
 
-var maskPatterns = struct {
-	email, creditCard, phone, bearerToken *regexp.Regexp
-}{
-	email:       regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`),
-	creditCard:  regexp.MustCompile(`\b(?:\d[ -]*?){13,16}\b`),
-	phone:       regexp.MustCompile(`(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}`),
-	bearerToken: regexp.MustCompile(`Bearer\s+[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*`),
+// eventIngestConfig, set once at the end of Init(), is what TrackEvent below
+// reads - Task H (competitive-roadmap.md).
+type eventIngestConfigT struct {
+	headers     map[string]string
+	serviceName string
 }
 
-func maskSensitiveData(text string) string {
-	text = maskPatterns.email.ReplaceAllString(text, "[EMAIL_MASKED]")
-	text = maskPatterns.creditCard.ReplaceAllString(text, "[CARD_MASKED]")
-	text = maskPatterns.phone.ReplaceAllString(text, "[PHONE_MASKED]")
-	text = maskPatterns.bearerToken.ReplaceAllString(text, "[TOKEN_MASKED]")
-	return text
-}
+var eventIngestConfig *eventIngestConfigT
+
+// Task 8 (todolist.md), expanded 2026-08-23 - see masking.go for the full
+// detection categories (PCI-DSS cards with Luhn validation, gitleaks-derived
+// secret prefixes, IBAN/MOD-97, US routing numbers, IP truncation, RFC1918
+// detection, internal hostname suffixes) and the customer-configurable
+// field-name mechanism (IsSensitiveFieldName/ConfigureMasking) that backs
+// proprietary/business-sensitive data, which has no pattern of its own.
+// maskSensitiveData itself now lives in masking.go.
 
 // maskingSpanProcessor wraps another SpanProcessor and masks string
 // attributes in OnEnd before they reach the real processor/exporter - the
@@ -127,7 +127,9 @@ func (p *maskingSpanProcessor) OnStart(parent context.Context, s sdktrace.ReadWr
 func (p *maskingSpanProcessor) OnEnd(s sdktrace.ReadOnlySpan) {
 	if rw, ok := s.(sdktrace.ReadWriteSpan); ok {
 		for _, attr := range s.Attributes() {
-			if attr.Value.Type() == attribute.STRING {
+			if IsSensitiveFieldName(string(attr.Key)) {
+				rw.SetAttributes(attribute.String(string(attr.Key), "[FIELD_MASKED]"))
+			} else if attr.Value.Type() == attribute.STRING {
 				rw.SetAttributes(attribute.String(string(attr.Key), maskSensitiveData(attr.Value.AsString())))
 			}
 		}
@@ -303,10 +305,79 @@ func Init(apiKey, serviceName string) {
 	// original destination unchanged.
 	log.SetOutput(&consoleBridgeWriter{original: os.Stderr})
 
+	// Task H (competitive-roadmap.md) - TrackEvent() reads this once Init()
+	// has resolved the same headers/serviceName every other exporter above
+	// already uses.
+	eventIngestConfig = &eventIngestConfigT{headers: headers, serviceName: serviceName}
+
 	// No synchronous "Active" print here: Init() stays non-blocking. Each
 	// signal's working/not-working state (and the "engaged fully/partially
 	// engaged/failed to engage" aggregate) is instead reported
 	// asynchronously by tracker as each signal's first flush resolves.
+}
+
+// TrackEvent marks a discrete event (a deploy, a feature-flag flip, a
+// customer-defined business event) so it shows up as a marker on the
+// dashboard's time-series charts - Task H (competitive-roadmap.md).
+// Fire-and-forget via a goroutine (matching owl24-js's non-awaited fetch) so
+// a slow/unreachable ingest endpoint never blocks the caller. attributes
+// values are masked the same way span/log attributes are before they ever
+// leave this process - only string-typed values go through the
+// value-pattern pass (matching maskingSpanProcessor's own restriction),
+// but every key still goes through the field-NAME check regardless of its
+// value's type. attributes may be nil.
+func TrackEvent(name string, attributes map[string]interface{}) {
+	config := eventIngestConfig
+	if config == nil {
+		fmt.Fprintln(os.Stderr, "[Owl24] TrackEvent() called before Init().")
+		return
+	}
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "[Owl24] TrackEvent() requires a non-empty name.")
+		return
+	}
+
+	masked := make(map[string]interface{}, len(attributes))
+	for key, value := range attributes {
+		if IsSensitiveFieldName(key) {
+			masked[key] = "[FIELD_MASKED]"
+		} else if s, ok := value.(string); ok {
+			masked[key] = maskSensitiveData(s)
+		} else {
+			masked[key] = value
+		}
+	}
+
+	go func() {
+		body, err := json.Marshal(map[string]interface{}{
+			"name":        name,
+			"serviceName": config.serviceName,
+			"attributes":  masked,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[Owl24] TrackEvent() failed: %v\n", err)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, ingestBaseURL+"/v1/events", bytes.NewReader(body))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[Owl24] TrackEvent() failed: %v\n", err)
+			return
+		}
+		for key, value := range config.headers {
+			req.Header.Set(key, value)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[Owl24] TrackEvent() failed: %v\n", err)
+			return
+		}
+		defer resp.Body.Close()
+	}()
 }
 
 // Tracer returns a tracer for creating manual spans. Go's net/http has no
