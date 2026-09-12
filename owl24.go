@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"runtime/debug"
@@ -30,18 +31,29 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Hardcoded, not configurable: owl24 is a fully-hosted service with one
-// fixed ingest endpoint - unlike the API key (per-customer) or user email,
-// there's nothing for a caller to legitimately point this at instead. See
-// the equivalent, deliberate choice in owl24-js/owl24-py/owl24-java.
-const ingestBaseURL = "https://ingest.owl24.dev"
+// defaultIngestBaseURL is owl24's hosted ingest endpoint - the default for
+// every existing customer. Self-hosted customers (running their own
+// collector on their own infrastructure) can override it via
+// InitWithConfig's Config.IngestBaseURL. See the equivalent override in
+// owl24-js/owl24-py/owl24-java.
+const defaultIngestBaseURL = "https://ingest.owl24.dev"
+
+// Config holds optional overrides for InitWithConfig. The zero value
+// reproduces today's Init(apiKey, serviceName) behavior exactly, so
+// existing hosted customers see zero behavior change.
+type Config struct {
+	// IngestBaseURL overrides the ingest endpoint. Defaults to
+	// defaultIngestBaseURL when empty. Set this to point the SDK at a
+	// self-hosted collector instead of owl24's hosted endpoint.
+	IngestBaseURL string
+}
 
 // Go has no runtime package-version introspection (unlike owl24-py's
 // importlib.metadata) and go.mod carries no version field of its own -
 // module versions live in git tags, external to the source. So this has to
 // be maintained by hand, kept in sync with whatever tag gets pushed for
 // each release.
-const sdkVersion = "0.1.3"
+const sdkVersion = "0.1.4"
 
 // checkSdkVersion is called once at the very start of Init() - separate
 // from the OTLP exporters below, since their interfaces never expose the
@@ -92,8 +104,9 @@ var (
 // eventIngestConfig, set once at the end of Init(), is what TrackEvent below
 // reads - Task H (competitive-roadmap.md).
 type eventIngestConfigT struct {
-	headers     map[string]string
-	serviceName string
+	headers       map[string]string
+	serviceName   string
+	ingestBaseURL string
 }
 
 var eventIngestConfig *eventIngestConfigT
@@ -178,11 +191,20 @@ func (w *consoleBridgeWriter) Write(p []byte) (int, error) {
 }
 
 // Init wires up traces, logs, and host metrics for the calling process,
-// exported to owl24's ingest endpoint. Any failure here degrades to a
-// no-op rather than taking the host application down - an observability
+// exported to owl24's hosted ingest endpoint. Any failure here degrades to
+// a no-op rather than taking the host application down - an observability
 // SDK failing to initialize shouldn't be able to crash the app it's
-// supposed to be observing.
+// supposed to be observing. Equivalent to InitWithConfig(apiKey,
+// serviceName, Config{}).
 func Init(apiKey, serviceName string) {
+	InitWithConfig(apiKey, serviceName, Config{})
+}
+
+// InitWithConfig is Init with an optional Config override - most notably
+// Config.IngestBaseURL, for self-hosted customers pointing this SDK at
+// their own collector instead of owl24's hosted ingest endpoint. A zero
+// Config behaves identically to Init.
+func InitWithConfig(apiKey, serviceName string, config Config) {
 	if apiKey == "" {
 		apiKey = os.Getenv("owl24_API_KEY")
 	}
@@ -204,6 +226,11 @@ func Init(apiKey, serviceName string) {
 
 	if serviceName == "" {
 		serviceName = "dice-server"
+	}
+
+	ingestBaseURL := config.IngestBaseURL
+	if ingestBaseURL == "" {
+		ingestBaseURL = defaultIngestBaseURL
 	}
 
 	ctx := context.Background()
@@ -243,6 +270,7 @@ func Init(apiKey, serviceName string) {
 	traceExporter, err := otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpointURL(ingestBaseURL+"/v1/traces"),
 		otlptracehttp.WithHeaders(headers),
+		otlptracehttp.WithCompression(otlptracehttp.GzipCompression),
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Owl24] Init failed: %v\n", err)
@@ -252,7 +280,15 @@ func Init(apiKey, serviceName string) {
 	trackedTraceExporter := &statusTrackingSpanExporter{delegate: traceExporter, tracker: tracker}
 	tracerProvider = sdktrace.NewTracerProvider(
 		sdktrace.WithResource(res),
-		sdktrace.WithSpanProcessor(&maskingSpanProcessor{wrapped: sdktrace.NewBatchSpanProcessor(trackedTraceExporter)}),
+		sdktrace.WithSpanProcessor(&maskingSpanProcessor{wrapped: sdktrace.NewBatchSpanProcessor(
+			trackedTraceExporter,
+			// Tuned faster than stock OTel defaults (30s/512/2048) to match
+			// this SDK's JS/Python/Java siblings - a deliberate low-latency
+			// compromise for an incident-response product, not an oversight.
+			sdktrace.WithBatchTimeout(10*time.Second),
+			sdktrace.WithMaxExportBatchSize(2048),
+			sdktrace.WithMaxQueueSize(8192),
+		)}),
 		sdktrace.WithSpanProcessor(&dbMetricsSpanProcessor{}),
 	)
 	otel.SetTracerProvider(tracerProvider)
@@ -260,6 +296,7 @@ func Init(apiKey, serviceName string) {
 	metricExporter, err := otlpmetrichttp.New(ctx,
 		otlpmetrichttp.WithEndpointURL(ingestBaseURL+"/v1/metrics"),
 		otlpmetrichttp.WithHeaders(headers),
+		otlpmetrichttp.WithCompression(otlpmetrichttp.GzipCompression),
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Owl24] Init failed: %v\n", err)
@@ -276,6 +313,7 @@ func Init(apiKey, serviceName string) {
 	logExporter, err := otlploghttp.New(ctx,
 		otlploghttp.WithEndpointURL(ingestBaseURL+"/v1/logs"),
 		otlploghttp.WithHeaders(headers),
+		otlploghttp.WithCompression(otlploghttp.GzipCompression),
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Owl24] Init failed: %v\n", err)
@@ -285,10 +323,40 @@ func Init(apiKey, serviceName string) {
 	trackedLogExporter := &statusTrackingLogExporter{delegate: logExporter, tracker: tracker}
 	loggerProvider = sdklog.NewLoggerProvider(
 		sdklog.WithResource(res),
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(trackedLogExporter)),
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(
+			trackedLogExporter,
+			// Matches the trace batch processor's tuning above.
+			sdklog.WithExportInterval(10*time.Second),
+			sdklog.WithExportMaxBatchSize(2048),
+			sdklog.WithMaxQueueSize(8192),
+		)),
 	)
 	loggl.SetLoggerProvider(loggerProvider)
 	otelLogger = loggerProvider.Logger("console-bridge")
+
+	// Startup jitter: both providers are constructed and registered above,
+	// so spans/logs are already being captured from t=0 - this goroutine
+	// only staggers the *first flush*, not readiness. Without it, a fleet
+	// of processes that all restart at the same wall-clock moment (a
+	// rolling deploy, a cold-start burst) would all hit their first
+	// BatchTimeout simultaneously and export in lockstep, spiking the
+	// ingestor. Deliberately non-blocking (no sleep before Init() returns)
+	// so this never delays k8s readiness probes or serverless cold starts.
+	go func(tp *sdktrace.TracerProvider, lp *sdklog.LoggerProvider) {
+		time.Sleep(time.Duration(rand.Int63n(int64(10 * time.Second))))
+
+		traceFlushCtx, traceCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer traceCancel()
+		if err := tp.ForceFlush(traceFlushCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "[Owl24] Startup jitter trace flush failed: %v\n", err)
+		}
+
+		logFlushCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer logCancel()
+		if err := lp.ForceFlush(logFlushCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "[Owl24] Startup jitter log flush failed: %v\n", err)
+		}
+	}(tracerProvider, loggerProvider)
 
 	// Host metrics (CPU/GC/memory/goroutines) - the Go equivalent of
 	// owl24-js's HostMetrics and owl24-java's runtime-telemetry-java8
@@ -308,7 +376,7 @@ func Init(apiKey, serviceName string) {
 	// Task H (competitive-roadmap.md) - TrackEvent() reads this once Init()
 	// has resolved the same headers/serviceName every other exporter above
 	// already uses.
-	eventIngestConfig = &eventIngestConfigT{headers: headers, serviceName: serviceName}
+	eventIngestConfig = &eventIngestConfigT{headers: headers, serviceName: serviceName, ingestBaseURL: ingestBaseURL}
 
 	// No synchronous "Active" print here: Init() stays non-blocking. Each
 	// signal's working/not-working state (and the "engaged fully/partially
@@ -361,7 +429,7 @@ func TrackEvent(name string, attributes map[string]interface{}) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, ingestBaseURL+"/v1/events", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, config.ingestBaseURL+"/v1/events", bytes.NewReader(body))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[Owl24] TrackEvent() failed: %v\n", err)
 			return
