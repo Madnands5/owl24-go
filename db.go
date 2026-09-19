@@ -54,14 +54,34 @@ func (p *dbMetricsSpanProcessor) ensureInstruments() {
 func (p *dbMetricsSpanProcessor) OnStart(ctx context.Context, s sdktrace.ReadWriteSpan) {}
 
 func (p *dbMetricsSpanProcessor) OnEnd(s sdktrace.ReadOnlySpan) {
-	var dbSystem, dbName string
+	// Both OpenTelemetry semantic-convention eras are accepted. semconv 1.x
+	// renamed db.system -> db.system.name and db.name -> db.namespace, and
+	// current instrumentation emits only the new spellings. Matching just the
+	// old names made this processor return early on every database span, so
+	// db.query.count/duration/error_count were never emitted and the
+	// dashboard's Database page stayed blank with nothing to explain it.
+	// Confirmed live in owl24-js on 2026-09-19; same bug, same fix here.
+	//
+	// The new names win when both are present, since an SDK emitting both is
+	// mid-migration and the 1.x value is the authoritative one.
+	var dbSystem, dbSystemLegacy, dbName, dbNameLegacy string
 	for _, attr := range s.Attributes() {
 		switch attr.Key {
-		case "db.system":
+		case "db.system.name":
 			dbSystem = attr.Value.AsString()
-		case "db.name":
+		case "db.system":
+			dbSystemLegacy = attr.Value.AsString()
+		case "db.namespace":
 			dbName = attr.Value.AsString()
+		case "db.name":
+			dbNameLegacy = attr.Value.AsString()
 		}
+	}
+	if dbSystem == "" {
+		dbSystem = dbSystemLegacy
+	}
+	if dbName == "" {
+		dbName = dbNameLegacy
 	}
 	if dbSystem == "" {
 		return
