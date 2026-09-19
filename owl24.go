@@ -1,6 +1,8 @@
 // Package owl24 is the Go SDK for the owl24 observability platform: one
 // function call wires up traces, logs, and host metrics, exported to
-// owl24's hosted ingest endpoint.
+// owl24's hosted ingest endpoint. Errors are deduplicated on arrival and
+// can be queued straight to your own coding agent, which claims them,
+// writes a fix, and opens a PR.
 package owl24
 
 import (
