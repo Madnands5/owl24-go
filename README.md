@@ -95,6 +95,10 @@ row := tracedDB.QueryRowContext(ctx, "SELECT ...")
 
 Each call creates a span tagged with `db.system`/`db.name`, which is automatically turned into `db.query.count`, `db.query.duration_ms`, and `db.query.error_count` on your dashboard's Database page, grouped by DB system.
 
+## Working with your coding agent
+
+Errors ingested via this SDK can be deduplicated and handed straight to your own coding agent - claim, investigate, fix, PR. Reach that queue interactively from Claude Code or Cursor with [owl24-mcp](https://github.com/Madnands5/owl24-mcp), or unattended via REST + AGENTS.md (see the [docs](https://owl24.dev/docs#agent-integration)).
+
 ## License
 
-MIT — see [LICENSE](https://github.com/Madnands5/owl24/blob/main/packages/owl24-go/LICENSE).
+MIT — see [LICENSE](https://github.com/Madnands5/owl24-go/blob/main/LICENSE).
